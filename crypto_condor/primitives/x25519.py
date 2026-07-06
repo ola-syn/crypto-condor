@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 import attrs
+import cffi
 import strenum
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -43,6 +44,7 @@ def __dir__():  # pragma: no cover
         # Runners
         test_harness.__name__,
         test_harness_python.__name__,
+        test_lib.__name__,
     ]
 
 
@@ -52,6 +54,7 @@ def __dir__():  # pragma: no cover
 class Wrapper(strenum.StrEnum):
     """Supported languages for wrappers."""
 
+    C = "C"
     PYTHON = "Python"
 
 
@@ -351,5 +354,71 @@ def test_harness(harness: Path, compliance: bool, resilience: bool) -> ResultsDi
     match harness.suffix:
         case ".py":
             return test_harness_python(harness, compliance, resilience)
+        case ".so" | ".dylib":
+            ffi = cffi.FFI()
+            lib = ffi.dlopen(str(harness.absolute()))
+            return test_lib(ffi, lib, ["CC_x25519_exchange"], compliance, resilience)
         case _:
-            raise ValueError(f"No test for '{harness.suffix}' harnesss")
+            raise ValueError(f"No test for '{harness.suffix}' harnesses")
+
+
+def _test_lib_exchange(
+    ffi: cffi.FFI, lib, function: str, compliance: bool, resilience: bool
+) -> ResultsDict:
+    logger.info("Testing harness function %s", function)
+
+    ffi.cdef(
+        f"""int {function}(uint8_t *shared_secret, size_t *shared_secret_size,
+                const uint8_t *secret_key, size_t secret_key_size,
+                const uint8_t *peer_key, size_t peer_key_size);
+        """
+    )
+
+    c_func = getattr(lib, function)
+
+    c_ss = ffi.new("uint8_t[32]")
+    c_ss_size = ffi.new("size_t *")
+
+    def _exchange(secret_key: bytes, peer_key: bytes) -> bytes:
+        c_sk = ffi.new("uint8_t[]", secret_key)
+        c_pk = ffi.new("uint8_t[]", peer_key)
+        rc = c_func(c_ss, c_ss_size, c_sk, len(secret_key), c_pk, len(peer_key))
+        if rc != 1:
+            raise ValueError(f"{function} failed with code {rc}")
+        return bytes(c_ss)[: c_ss_size[0]]
+
+    return test_exchange(_exchange, compliance, resilience)
+
+
+def test_lib(
+    ffi: cffi.FFI, lib, functions: list[str], compliance: bool, resilience: bool
+) -> ResultsDict:
+    """Tests functions from a shared library.
+
+    Args:
+        ffi:
+            The FFI instance.
+        lib:
+            The dlopen'd library.
+        functions:
+            A list of functions to test.
+        compliance:
+            Whether to use compliance test vectors.
+        resilience:
+            Whether to use resilience test vectors.
+    """
+    logger.info("Found harness functions %s", ", ".join(functions))
+
+    rd = ResultsDict()
+
+    for function in functions:
+        match function.split("_"):
+            case ["CC", "x25519", "exchange"]:
+                rd |= _test_lib_exchange(ffi, lib, function, compliance, resilience)
+            case ["CC", "x25519", *_]:
+                logger.warning("Invalid CC_x25519 function %s, skipped", function)
+                continue
+            case _:
+                pass
+
+    return rd
